@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TBS Alternative HLS Player</title>
+  <style>
+    *{box-sizing:border-box}
+    html,body{margin:0;background:#10151c;color:#f0f4f9;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+    .app{max-width:1100px;margin:auto;padding:12px}
+    .screen{aspect-ratio:16/9;background:#000;border-radius:12px;overflow:hidden;position:relative}
+    video{display:block;width:100%;height:100%;background:#000}
+    .controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px 0}
+    button,select{background:#233144;color:#fff;border:1px solid #4d607a;border-radius:8px;padding:10px;font-size:14px;cursor:pointer}
+    button:hover{background:#324862}
+    button:disabled{opacity:.5;cursor:default}
+    select{flex:1;min-width:180px}
+    #start{background:#16704d;border-color:#329569;font-weight:700}
+    .info{font-size:13px;line-height:1.65;padding:10px 12px;background:#1a2431;border-radius:8px}
+    .status{font-weight:700}
+    .sub{color:#b7c4d3;font-size:12px;margin-top:5px;overflow-wrap:anywhere}
+    .sub a{color:#add5ff}
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.7.4/dist/hls.min.js"></script>
+</head>
+<body>
+<div class="app">
+  <div class="screen"><video id="tv" controls playsinline preload="none"></video></div>
+  <div class="controls">
+    <select id="source" aria-label="配信元">
+      <option value="auto">自動切替（MOV3不使用）</option>
+    </select>
+    <button id="start">▶ 再生開始</button>
+    <button id="next">↻ 次の配信元</button>
+    <button id="retry">最初から再試行</button>
+  </div>
+  <div class="info">
+    <div id="status" class="status" role="status">待機中。再生開始を押してください。</div>
+    <div id="detail" class="sub">配信URLはMOV3以外を使用します。</div>
+    <div id="stats" class="sub"></div>
+    <div class="sub"><a id="direct" href="#" target="_blank" rel="noopener noreferrer" hidden>現在の配信URL</a></div>
+  </div>
+</div>
+<script>
+(() => {
+  'use strict';
+
+  // GitHub上の公開プレイリストに掲載されたMOV3以外のTBS候補。
+  // リンクの生存、CORS許可、配信権限および上流配信元は未検証。
+  const SOURCES = [
+    {name: 'Sankuria', url: 'https://akariko-bck1.sankuria.sbs/stream/jp/tbs/stream-output.m3u8?mode=hls'},
+    {name: 'UTAKO US01', url: 'https://us01.utako.moe/TBS/index.m3u8'},
+    {name: 'UTAKO Primehome', url: 'https://proxyv2.utako.moe/ph.php?isp=8&id=hdgd04'},
+    {name: 'NETGENX', url: 'https://naori-test.netgenx.site/pxx.php?shk_cid=hdgd04'}
+  ];
+
+  const video = document.getElementById('tv');
+  const choice = document.getElementById('source');
+  const statusEl = document.getElementById('status');
+  const detailEl = document.getElementById('detail');
+  const statsEl = document.getElementById('stats');
+  const direct = document.getElementById('direct');
+  const startButton = document.getElementById('start');
+
+  SOURCES.forEach((src, index) => {
+    const item = document.createElement('option');
+    item.value = String(index);
+    item.textContent = src.name;
+    choice.appendChild(item);
+  });
+
+  let hls = null;
+  let current = -1;
+  let generation = 0;
+  let startedAt = 0;
+  let lastProgressAt = 0;
+  let lastVideoTime = 0;
+  let sourcePlayed = false;
+  let mediaRecoveryUsed = false;
+  let playingWanted = false;
+  let needsUserClick = false;
+  let switching = false;
+  let ignorePauseUntil = 0;
+  let tried = new Set();
+  let lastProblem = '';
+
+  function message(s, detail = '') {
+    statusEl.textContent = s;
+    detailEl.textContent = detail;
+  }
+
+  function bufferAhead() {
+    const t = video.currentTime;
+    for (let i = 0; i < video.buffered.length; i++) {
+      if (t >= video.buffered.start(i)-0.1 && t <= video.buffered.end(i)) {
+        return Math.max(0, video.buffered.end(i)-t);
+      }
+    }
+    return 0;
+  }
+
+  function protectAudio() {
+    if ('preservesPitch' in video) video.preservesPitch = true;
+    if ('webkitPreservesPitch' in video) video.webkitPreservesPitch = true;
+    video.defaultPlaybackRate = 1;
+    if (video.playbackRate !== 1) video.playbackRate = 1;
+  }
+
+  function release() {
+    ignorePauseUntil = performance.now() + 1500;
+    switching = true;
+    if (hls) {
+      try { hls.destroy(); } catch (_) {}
+      hls = null;
+    }
+    try {
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
+    } catch (_) {}
+    switching = false;
+  }
+
+  function playIfAllowed() {
+    if (!playingWanted) return;
+    protectAudio();
+    const request = video.play();
+    if (request && typeof request.catch === 'function') {
+      request.catch(err => {
+        if (err && err.name === 'NotAllowedError') {
+          needsUserClick = true;
+          message('▶ 動画の再生ボタンを押してください', 'ブラウザが自動再生を制限しています。');
+        } else if (err && err.name !== 'AbortError') {
+          lastProblem = '再生開始エラー: ' + err.message;
+        }
+      });
+    }
+  }
+
+  function openSource(index) {
+    if (!Number.isInteger(index) || index < 0 || index >= SOURCES.length) return;
+    ++generation;
+    const myGeneration = generation;
+    release();
+    current = index;
+    tried.add(index);
+    sourcePlayed = false;
+    mediaRecoveryUsed = false;
+    needsUserClick = false;
+    startedAt = performance.now();
+    lastProgressAt = startedAt;
+    lastVideoTime = 0;
+    lastProblem = '';
+
+    const source = SOURCES[index];
+    direct.href = source.url;
+    direct.hidden = false;
+    message('接続中… ' + source.name, 'MOV3は経由しません。');
+    console.log('[TBS] 接続先', source.name, source.url);
+
+    if (window.Hls && Hls.isSupported()) {
+      hls = new Hls({
+        autoStartLoad: true,
+        startLevel: -1,
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
+        backBufferLength: 30,
+        liveSyncDurationCount: 5,
+        liveMaxLatencyDurationCount: 18,
+        maxLiveSyncPlaybackRate: 1,
+        enableWorker: true,
+        lowLatencyMode: false
+      });
+      const instance = hls;
+
+      instance.on(Hls.Events.MEDIA_ATTACHED, () => {
+        if (myGeneration === generation) instance.loadSource(source.url);
+      });
+
+      instance.on(Hls.Events.MANIFEST_PARSED, () => {
+        if (myGeneration !== generation) return;
+        message('準備完了：' + source.name, '再生を開始しています。');
+        playIfAllowed();
+      });
+
+      instance.on(Hls.Events.ERROR, (_event, data) => {
+        if (myGeneration !== generation || !data) return;
+        const reason = data.details || data.type || 'HLS error';
+        lastProblem = reason + (data.response?.code ? ' (HTTP ' + data.response.code + ')' : '');
+        console.warn('[TBS] HLS error', source.name, lastProblem, data.fatal ? '(fatal)' : '');
+        if (!data.fatal) return;
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !mediaRecoveryUsed) {
+          mediaRecoveryUsed = true;
+          try {
+            instance.recoverMediaError();
+            message('デコードを復旧中…', lastProblem);
+            return;
+          } catch (_) {}
+        }
+        failover(lastProblem);
+      });
+
+      try { instance.attachMedia(video); }
+      catch (error) { failover('プレイヤー初期化失敗: ' + error.message); }
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      // SafariなどでHLSのネイティブ再生が使える場合
+      video.src = source.url;
+      video.addEventListener('loadedmetadata', function once() {
+        video.removeEventListener('loadedmetadata', once);
+        if (myGeneration === generation) playIfAllowed();
+      });
+      video.load();
+    } else {
+      message('このブラウザではHLSを再生できません', 'hls.jsのCDNがブロックされていないか確認してください。');
+      playingWanted = false;
+    }
+  }
+
+  function failover(reason) {
+    if (!playingWanted || needsUserClick) return;
+    lastProblem = reason;
+    if (choice.value !== 'auto') {
+      release();
+      message('再生できません：' + SOURCES[current].name, reason + '。別の配信元を選択してください。');
+      return;
+    }
+    const next = SOURCES.findIndex((_s, i) => !tried.has(i));
+    if (next < 0) {
+      release();
+      message('全候補で再生に失敗しました', reason + '。配信元の停止やCORS制限の可能性があります。');
+      playingWanted = false;
+      return;
+    }
+    message('別の配信元に切替中…', reason);
+    openSource(next);
+  }
+
+  function start() {
+    if (typeof window.Hls === 'undefined' && !video.canPlayType('application/vnd.apple.mpegurl')) {
+      message('hls.jsを読み込めません', 'CDNへの接続やGoogle Sitesの埋め込み制限を確認してください。');
+      return;
+    }
+    tried.clear();
+    playingWanted = true;
+    needsUserClick = false;
+    const requested = choice.value === 'auto' ? 0 : Number(choice.value);
+    openSource(requested);
+  }
+
+  function next() {
+    tried.clear();
+    playingWanted = true;
+    needsUserClick = false;
+    const index = (current + 1 + SOURCES.length) % SOURCES.length;
+    if (choice.value !== 'auto') choice.value = String(index);
+    openSource(index);
+  }
+
+  document.getElementById('start').addEventListener('click', start);
+  document.getElementById('next').addEventListener('click', next);
+  document.getElementById('retry').addEventListener('click', () => {
+    tried.clear();
+    playingWanted = true;
+    needsUserClick = false;
+    openSource(current >= 0 ? current : 0);
+  });
+  choice.addEventListener('change', () => {
+    if (playingWanted) start();
+  });
+
+  video.addEventListener('playing', () => {
+    if (switching) return;
+    sourcePlayed = true;
+    needsUserClick = false;
+    playingWanted = true;
+    lastProgressAt = performance.now();
+    lastVideoTime = video.currentTime;
+    message('● 再生中：' + SOURCES[current].name, '音声は通常速度（1.0倍）で再生します。');
+  });
+  video.addEventListener('timeupdate', () => {
+    if (switching) return;
+    if (video.currentTime > lastVideoTime + 0.08) {
+      lastVideoTime = video.currentTime;
+      lastProgressAt = performance.now();
+    }
+  });
+  video.addEventListener('ratechange', protectAudio);
+  video.addEventListener('pause', () => {
+    if (!switching && performance.now() > ignorePauseUntil && sourcePlayed && !video.ended) {
+      playingWanted = false;
+      message('一時停止中', '再生ボタンで再開できます。');
+    }
+  });
+  video.addEventListener('play', () => {
+    if (!switching) { playingWanted = true; needsUserClick = false; }
+  });
+  video.addEventListener('error', () => {
+    if (switching || current < 0 || !playingWanted) return;
+    lastProblem = video.error?.message || 'Media element error';
+    // HLS.jsによる復旧判定を優先して、こちらでは即座に二重切替しない。
+    if (!hls) failover(lastProblem);
+  });
+
+  setInterval(() => {
+    if (current < 0) return;
+    protectAudio();
+    statsEl.textContent =
+      `バッファ ${bufferAhead().toFixed(1)}秒 | 再生速度 ${video.playbackRate.toFixed(2)}x | ` +
+      `候補 ${tried.size}/${SOURCES.length}` + (lastProblem ? ` | 最後の問題: ${lastProblem}` : '');
+    if (!playingWanted || needsUserClick || video.seeking || switching) return;
+    const now = performance.now();
+    if (!sourcePlayed && now - startedAt > 22000) {
+      failover('22秒以内に再生開始できませんでした');
+    } else if (sourcePlayed && !video.paused && now - lastProgressAt > 12000) {
+      failover('12秒間、再生位置が進みませんでした');
+    }
+  }, 1500);
+
+  protectAudio();
+  window.TBSAlternative = {
+    start, next,
+    status: () => ({source: SOURCES[current]?.name || 'none', buffer: bufferAhead(),
+      playbackRate: video.playbackRate, lastProblem, tried: [...tried]}),
+    stop: () => {playingWanted = false; ++generation; release(); message('停止しました');}
+  };
+})();
+</script>
+</body>
+</html>
